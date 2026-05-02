@@ -3,6 +3,7 @@ from os import getenv
 from pathlib import Path
 from typing import Any
 
+import yaml
 from pydantic import ValidationInfo
 
 
@@ -27,11 +28,7 @@ def pydantic_env_or_default(v: Any, info: ValidationInfo) -> Any:
 def read_vault_field(path: Path, field_name: str) -> str | None:
     if not path.exists():
         return None
-    for line in path.read_text().splitlines():
-        key, _, value = line.partition("=")
-        if key.strip() == field_name:
-            return value.strip()
-    return None
+    return (yaml.safe_load(path.read_text()) or {}).get(field_name)
 
 
 def pydantic_vault_or_default(
