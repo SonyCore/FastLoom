@@ -1,6 +1,10 @@
 import asyncio
 import logging
-from typing import Any
+from collections.abc import Callable
+from contextlib import suppress
+from os import getenv
+from pathlib import Path
+from typing import Any, ClassVar
 
 import aio_pika
 from aio_pika import Message
@@ -21,9 +25,11 @@ from faststream.rabbit.schemas.queue import (
     StreamQueueArgs,
 )
 from opentelemetry import trace
+from watchfiles import awatch
 
 from fastloom.meta import SelfSustaining
 from fastloom.settings.base import MonitoringSettings
+from fastloom.settings.utils import read_vault_field
 from fastloom.signals.middlewares import RabbitPayloadTelemetryMiddleware
 from fastloom.signals.settings import RabbitmqSettings
 
@@ -45,6 +51,22 @@ def get_rabbit_router(name: str, settings: RabbitmqSettings) -> RabbitRouter:
 class RabbitSubscriptable(MonitoringSettings, RabbitmqSettings): ...
 
 
+class _ResilientPublisher:
+    """Publishes through RabbitSubscriber's current broker each call, so
+    module-level publisher handles survive a broker swap during rotation."""
+
+    def __init__(self, cls_ref: type, **kwargs: Any) -> None:
+        self._cls = cls_ref
+        kwargs.pop("schema", None)
+        self._kwargs = kwargs
+
+    async def publish(self, message: Any, **kwargs: Any) -> Any:
+        async with self._cls._swap_lock:
+            return await self._cls.router.broker.publish(
+                message, **{**self._kwargs, **kwargs}
+            )
+
+
 class RabbitSubscriber(SelfSustaining):
     """A class to encapsulate the common logic for RabbitMQ subscribers"""
 
@@ -59,6 +81,11 @@ class RabbitSubscriber(SelfSustaining):
     _topology_connection: RobustConnection | None = None
     _topology_channel: RobustChannel | None = None
     _topology_lock = asyncio.Lock()
+
+    _vault_path: Path = Path(getenv("VAULT_FILE", ""))
+    _watch_task: asyncio.Task[None] | None = None
+    _subscriber_registry: ClassVar[list[tuple[Callable, str, dict]]] = []
+    _swap_lock = asyncio.Lock()
 
     def __init__(
         self,
@@ -126,6 +153,12 @@ class RabbitSubscriber(SelfSustaining):
         return routing_key.replace("*", "__all__")
 
     @classmethod
+    def _resolve_rabbit_uri(cls) -> str:
+        return read_vault_field(cls._vault_path, "RABBIT_URI") or str(
+            cls._settings.RABBIT_URI
+        )
+
+    @classmethod
     async def _get_topology_channel(cls) -> RobustChannel:
         async with cls._topology_lock:
             if (
@@ -133,7 +166,8 @@ class RabbitSubscriber(SelfSustaining):
                 or cls._topology_connection.is_closed
             ):
                 cls._topology_connection = await aio_pika.connect_robust(
-                    cls._settings.RABBIT_URI, loop=asyncio.get_event_loop()
+                    cls._resolve_rabbit_uri(),
+                    loop=asyncio.get_event_loop(),
                 )
                 cls._topology_channel = None
                 logging.warning("new topology connection established")
@@ -156,6 +190,73 @@ class RabbitSubscriber(SelfSustaining):
                 await cls._topology_channel.close()
 
             cls._topology_channel = None
+
+    @classmethod
+    async def _swap_broker(cls) -> None:
+        async with cls._swap_lock:
+            async with cls._topology_lock:
+                if (
+                    cls._topology_channel
+                    and not cls._topology_channel.is_closed
+                ):
+                    await cls._topology_channel.close()
+                if (
+                    cls._topology_connection
+                    and not cls._topology_connection.is_closed
+                ):
+                    await cls._topology_connection.close()
+                cls._topology_channel = None
+                cls._topology_connection = None
+
+            with suppress(Exception):
+                await cls.router.broker.close()
+
+            cls._settings.RABBIT_URI = cls._resolve_rabbit_uri()  # type: ignore[assignment]
+            cls(
+                cls._settings,
+                base_delay=cls._base_delay,
+                max_delay=cls._max_delay,
+            )
+            # for func, routing_key, sub_kwargs in cls._subscriber_registry:
+            #     cls._apply_subscriber(func, routing_key, **sub_kwargs)
+
+            await cls.router.broker.start()
+            logger.info("reloaded with rotated vault credentials")
+
+    @classmethod
+    async def _watch_credentials(cls) -> None:
+        target = cls._vault_path.name
+        watch_dir = str(cls._vault_path.parent)
+        while True:
+            try:
+                async for changes in awatch(watch_dir):
+                    if any(Path(p).name == target for _, p in changes):
+                        await cls._swap_broker()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("watcher errored; restarting in 5s")
+                await asyncio.sleep(5)
+
+    @classmethod
+    def start_watcher(cls, vault_path: Path | None = None) -> None:
+        if cls._watch_task is not None:
+            return
+        if vault_path is not None:
+            cls._vault_path = vault_path
+        if str(cls._vault_path) in ("", "."):
+            logger.warning("vault_path not configured; rotation disabled")
+            return
+        cls._watch_task = asyncio.create_task(cls._watch_credentials())
+
+    @classmethod
+    async def stop_watcher(cls) -> None:
+        if cls._watch_task is None:
+            return
+        cls._watch_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cls._watch_task
+        cls._watch_task = None
 
     @classmethod
     def _get_queue(
@@ -299,6 +400,42 @@ class RabbitSubscriber(SelfSustaining):
         )
 
     @classmethod
+    def _apply_subscriber(
+        cls,
+        func: Callable,
+        routing_key: str,
+        retry_backoff: bool = False,
+        durable: bool = True,
+        auto_delete: bool = False,
+        queue_arguments: QuorumQueueArgs
+        | ClassicQueueArgs
+        | StreamQueueArgs
+        | None = None,
+        **kwargs,
+    ) -> Callable:
+        decorators = [
+            cls._get_subscriber(
+                routing_key,
+                durable=durable,
+                auto_delete=auto_delete,
+                queue_arguments=queue_arguments,
+                **kwargs,
+            )
+        ]
+        if retry_backoff:
+            decorators.append(
+                cls._get_subscriber(
+                    f"{routing_key}{cls._dlx_suffix()}",
+                    durable=durable,
+                    auto_delete=auto_delete,
+                    **kwargs,
+                )
+            )
+        for decorator in decorators:
+            func = decorator(func)
+        return func
+
+    @classmethod
     def subscriber(
         cls,
         routing_key: str,
@@ -321,30 +458,17 @@ class RabbitSubscriber(SelfSustaining):
             raise ValueError(
                 "retry_backoff requires durable queues and auto_delete=False"
             )
+        sub_kwargs: dict = {
+            "retry_backoff": retry_backoff,
+            "durable": durable,
+            "auto_delete": auto_delete,
+            "queue_arguments": queue_arguments,
+            **kwargs,
+        }
 
         def _inner(func):
-            decorators = [
-                cls._get_subscriber(
-                    routing_key,
-                    durable=durable,
-                    auto_delete=auto_delete,
-                    queue_arguments=queue_arguments,
-                    **kwargs,
-                )
-            ]
-            if retry_backoff:
-                decorators.append(
-                    cls._get_subscriber(
-                        f"{routing_key}{cls._dlx_suffix()}",
-                        durable=durable,
-                        auto_delete=auto_delete,
-                        **kwargs,
-                    )
-                )
-            for decorator in decorators:
-                func = decorator(func)
-
-            return func
+            cls._subscriber_registry.append((func, routing_key, sub_kwargs))
+            return cls._apply_subscriber(func, routing_key, **sub_kwargs)
 
         return _inner
 
@@ -362,7 +486,8 @@ class RabbitSubscriber(SelfSustaining):
         :param kwargs: additional faststream subscriber arguments
         :return: persistent publisher
         """
-        return cls.router.publisher(
+        return _ResilientPublisher(
+            cls,
             routing_key=routing_key,
             exchange=cls.exchange,
             schema=schema,
@@ -412,7 +537,8 @@ class RabbitSubscriber(SelfSustaining):
         :param kwargs: additional arguments for the faststream publishers
         """
         return {
-            key: cls.router.publisher(
+            key: _ResilientPublisher(
+                cls,
                 exchange=cls.exchange,
                 routing_key=routing_key,
                 persist=persist,
